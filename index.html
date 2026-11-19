@@ -300,15 +300,15 @@ void main(){
   } catch (e) { console.warn('WebGL nonaktif:', e); gl = null; }
 }
 
-let renderScale = 1;
 function outSize() {
+  if (exportSize) return exportSize;
   const R = { '9:16': [720, 1280], '16:9': [1280, 720], '1:1': [1080, 1080], '4:5': [864, 1080], '3:4': [810, 1080] };
   let wh = R[S.aspect];
   if (!wh) {
     const c = S.clips[0], m = c && media[c.mediaId];
     if (m && m.w) { const k = 1280 / Math.max(m.w, m.h); wh = [m.w * k, m.h * k]; } else wh = [720, 1280];
   }
-  return [even(wh[0] * renderScale), even(wh[1] * renderScale)];
+  return [even(wh[0]), even(wh[1])];
 }
 function resizeOut() {
   const [W, H] = outSize();
@@ -364,7 +364,7 @@ function drawMedia(m, a) {
     gl.uniform1f(U.vg, f.v); gl.uniform1f(U.g, f.g); gl.uniform1f(U.sp, f.sp);
     gl.uniform1f(U.gr, f.gr); gl.uniform1f(U.lf, f.lf); gl.uniform1f(U.ca, f.ca); gl.uniform1f(U.lk, f.lk);
     gl.uniform3f(U.sh, f.sh[0], f.sh[1], f.sh[2]); gl.uniform3f(U.hl, f.hl[0], f.hl[1], f.hl[2]);
-    gl.uniform1f(U.time, (performance.now() - t0) / 1000); gl.uniform1f(U.int, c.fInt == null ? 1 : c.fInt);
+    gl.uniform1f(U.time, exporting ? T : (performance.now() - t0) / 1000); gl.uniform1f(U.int, c.fInt == null ? 1 : c.fInt);
     gl.uniform1f(U.fd, clamp(an.al, 0, 1));
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     octx.drawImage(glc, 0, 0);
@@ -623,6 +623,7 @@ function needsAnimFrame() { const a = clipAt(T); return a && a.c.filter && (a.c.
 let lastStill = 0;
 function loop(now) {
   requestAnimationFrame(loop);
+  if (offline) return;
   if (playing) { const dt = Math.min(0.1, (now - lastNow) / 1000); lastNow = now; step(dt); dirty = true; }
   else if (now - lastStill > 120 && needsAnimFrame()) { lastStill = now; dirty = true; } // grain tetap hidup saat jeda
   if (dirty) { dirty = false; render(); updateTimeUI(); }
@@ -1339,62 +1340,306 @@ function openSettings() {
 }
 
 /* ============ Ekspor ============ */
-let rec = null, chunks = [], recMime = '', expQuality = store('ve_q') || '720p', expAudioOnly = false;
-function waitSeek() { return new Promise(r => { const a = clipAt(0); const m = a && media[a.c.mediaId]; if (!m || m.type !== 'video' || !m.el.seeking) return setTimeout(r, 150); m.el.addEventListener('seeked', () => setTimeout(r, 80), { once: true }); setTimeout(r, 2000); }); }
+// Mode utama: render offline frame-demi-frame (tidak bergantung kecepatan layar) + WebCodecs H.264 + audio dimix offline,
+// dibungkus sebagai .MOV (H.264 + PCM) yang didukung penuh oleh app Foto iPhone.
+// Cadangan: perekaman real-time (MediaRecorder) untuk browser lama.
+let rec = null, chunks = [], recMime = '', expAudioOnly = false, exportSize = null, offline = false, cancelExp = false;
+let expQuality = store('ve_q2') || 'asli', expFps = parseInt(store('ve_fps')) || 30;
+const ASPECTS = { '9:16': 9 / 16, '16:9': 16 / 9, '1:1': 1, '4:5': 4 / 5, '3:4': 3 / 4 };
+function sizeFor(q) {
+  const srcs = S.clips.map(c => media[c.mediaId]).filter(m => m && m.w && !m.error);
+  let r = ASPECTS[S.aspect];
+  if (!r) { const m = srcs[0]; r = m ? m.w / m.h : 9 / 16; }
+  let s = q === '1080p' ? 1080 : q === '720p' ? 720 : Math.max(720, ...srcs.map(m => Math.min(m.w, m.h)));
+  if (q === 'asli' && S.aspect === 'original' && srcs[0]) { s = Math.min(srcs[0].w, srcs[0].h); }
+  let W = r < 1 ? s : s * r, H = r < 1 ? s / r : s;
+  const k = Math.min(1, 3840 / Math.max(W, H)); W *= k; H *= k;
+  return [even(W), even(H)];
+}
+const hasEncoder = () => typeof window.VideoEncoder === 'function' && typeof window.VideoFrame === 'function';
+async function pickCodec(W, H, fps, bitrate) {
+  const mbs = Math.ceil(W / 16) * Math.ceil(H / 16), mbps = mbs * fps;
+  const levels = [[0x1f, 3600, 108000], [0x20, 5120, 216000], [0x28, 8192, 245760], [0x2a, 8704, 522240], [0x32, 22080, 589824], [0x33, 36864, 983040], [0x34, 36864, 2073600]];
+  const lv = levels.filter(([, f, s]) => mbs <= f && mbps <= s).map(x => x[0]);
+  for (const prof of ['6400', '4d00', '42e0']) for (const l of lv) {
+    const cfg = { codec: 'avc1.' + prof + l.toString(16).padStart(2, '0'), width: W, height: H, bitrate, framerate: fps, avc: { format: 'avc' }, latencyMode: 'quality' };
+    try { const r = await VideoEncoder.isConfigSupported(cfg); if (r && r.supported) return cfg; } catch (e) { }
+  }
+  return null;
+}
+function seekExact(v, t) {
+  return new Promise(res => {
+    t = clamp(t, 0, Math.max(0, (v.duration || 0) - 0.001));
+    if (Math.abs(v.currentTime - t) < 0.004 && v.readyState >= 2 && !v.seeking) return res();
+    let done = false;
+    const fin = () => { if (done) return; done = true; v.removeEventListener('seeked', onS); res(); };
+    const onS = () => { if (v.requestVideoFrameCallback) { v.requestVideoFrameCallback(() => fin()); setTimeout(fin, 40); } else fin(); };
+    v.addEventListener('seeked', onS); v.currentTime = t; setTimeout(fin, 5000);
+  });
+}
+// --- Audio: time-stretch WSOLA (kecepatan berubah tanpa mengubah nada) ---
+function timeStretch(chs, rate) {
+  const n = chs[0].length, N = 1024, Hs = 512, tol = 256;
+  if (n < N * 2) return chs.map(x => x.slice(0, Math.max(1, Math.floor(n / rate))));
+  const outLen = Math.floor(n / rate), win = new Float32Array(N);
+  for (let j = 0; j < N; j++) win[j] = 0.5 - 0.5 * Math.cos(2 * Math.PI * j / N);
+  const mono = chs.length > 1 ? chs[0].map((x, i) => (x + chs[1][i]) * 0.5) : chs[0];
+  const outs = chs.map(() => new Float32Array(outLen + N)), norm = new Float32Array(outLen + N);
+  let prev = 0;
+  for (let o = 0, k = 0; o < outLen; o += Hs, k++) {
+    let best = clamp(Math.round(o * rate), 0, n - N);
+    if (k > 0) {
+      const nat = prev + Hs, nom = best; let bc = -Infinity;
+      if (nat + N <= n) for (let d = -tol; d <= tol; d += 4) {
+        const p = nom + d; if (p < 0 || p + N > n) continue;
+        let c = 0; for (let j = 0; j < N; j += 8) c += mono[p + j] * mono[nat + j];
+        if (c > bc) { bc = c; best = p; }
+      }
+    }
+    for (let ch = 0; ch < chs.length; ch++) { const src = chs[ch], dst = outs[ch]; for (let j = 0; j < N; j++) dst[o + j] += src[best + j] * win[j]; }
+    for (let j = 0; j < N; j++) norm[o + j] += win[j];
+    prev = best;
+  }
+  return outs.map(x => { const r = new Float32Array(outLen); for (let i = 0; i < outLen; i++) r[i] = norm[i] > 1e-3 ? x[i] / norm[i] : x[i]; return r; });
+}
+async function mixAudio(onProg) {
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext; if (!OAC) return null;
+  const SR = 48000, tot = total(), ctx = new OAC(2, Math.max(1, Math.ceil(tot * SR)), SR);
+  const cache = new Map(), failed = new Set();
+  const getBuf = async (url, name) => {
+    if (cache.has(url)) return cache.get(url);
+    let b = null;
+    try { const ab = await (await fetch(url)).arrayBuffer(); b = await new Promise((res, rej) => { const p = ctx.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); }); }
+    catch (e) { b = null; failed.add(name); }
+    cache.set(url, b); return b;
+  };
+  const sched = (buf, at, inS, outS, sp, pitch, vol, fi, fo) => {
+    if (!buf || vol <= 0 || at >= tot) return;
+    outS = Math.min(outS, buf.duration); if (outS - inS < 0.01) return;
+    const d = (outS - inS) / sp, src = ctx.createBufferSource();
+    if (sp !== 1 && pitch && sp >= 0.25 && sp <= 4) {
+      const a = Math.floor(inS * buf.sampleRate), b = Math.floor(outS * buf.sampleRate), chs = [];
+      for (let c = 0; c < Math.min(2, buf.numberOfChannels); c++) chs.push(buf.getChannelData(c).subarray(a, b));
+      const st = timeStretch(chs, sp), nb = ctx.createBuffer(st.length, st[0].length, buf.sampleRate);
+      st.forEach((x, c) => nb.getChannelData(c).set(x));
+      src.buffer = nb; src.start(at);
+    } else { src.buffer = buf; src.playbackRate.value = sp; src.start(at, inS); }
+    src.stop(at + d);
+    fi = Math.min(fi || 0, d); fo = Math.min(fo || 0, d - fi);
+    const g = ctx.createGain(), gp = g.gain;
+    gp.setValueAtTime(fi > 0 ? 0 : vol, at); if (fi > 0) gp.linearRampToValueAtTime(vol, at + fi);
+    if (fo > 0) { gp.setValueAtTime(vol, at + d - fo); gp.linearRampToValueAtTime(0, at + d); }
+    src.connect(g); g.connect(ctx.destination);
+  };
+  const st = starts(), jobs = [];
+  S.clips.forEach((c, i) => { const m = media[c.mediaId]; if (m && m.type === 'video' && c.volume > 0) jobs.push([m, st[i], c.in, c.out, c.speed, c.pitch !== false, c.volume, c.afIn, c.afOut]); });
+  S.music.forEach(mu => { const m = media[mu.mediaId]; if (m) jobs.push([m, mu.start, mu.in, mu.out, mu.speed || 1, mu.pitch !== false, mu.volume, mu.fadeIn, mu.fadeOut]); });
+  for (let i = 0; i < jobs.length; i++) {
+    if (cancelExp) return null;
+    const [m, ...rest] = jobs[i]; sched(await getBuf(m.url, m.name), ...rest);
+    onProg && onProg((i + 1) / (jobs.length + 1));
+  }
+  const p = ctx.startRendering();
+  const buf = (p && p.then) ? await p : await new Promise(r => ctx.oncomplete = e => r(e.renderedBuffer));
+  return { buf, failed: [...failed] };
+}
+function toPCM16(buf) {
+  const n = buf.length, L = buf.getChannelData(0), R = buf.numberOfChannels > 1 ? buf.getChannelData(1) : L, o = new Int16Array(n * 2);
+  for (let i = 0; i < n; i++) { o[2 * i] = clamp(L[i], -1, 1) * 32767; o[2 * i + 1] = clamp(R[i], -1, 1) * 32767; }
+  return o; // little-endian (iPhone) = 'sowt'
+}
+function wavBlob(pcm, sr) {
+  const h = new DataView(new ArrayBuffer(44)), len = pcm.byteLength, w = (o, s) => [...s].forEach((c, i) => h.setUint8(o + i, c.charCodeAt(0)));
+  w(0, 'RIFF'); h.setUint32(4, 36 + len, true); w(8, 'WAVE'); w(12, 'fmt '); h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 2, true);
+  h.setUint32(24, sr, true); h.setUint32(28, sr * 4, true); h.setUint16(32, 4, true); h.setUint16(34, 16, true); w(36, 'data'); h.setUint32(40, len, true);
+  return new Blob([h.buffer, pcm.buffer], { type: 'audio/wav' });
+}
+// --- Muxer QuickTime .MOV (H.264 + PCM 16-bit) ---
+const U32 = v => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+const U16 = v => [(v >>> 8) & 255, v & 255];
+const S4 = s => [...s].map(c => c.charCodeAt(0));
+const Z = n => new Array(n).fill(0);
+function B(type, ...parts) { let body = []; for (const p of parts) body = body.concat(p); return U32(body.length + 8).concat(S4(type), body); }
+const MATRIX = [].concat(U32(0x10000), U32(0), U32(0), U32(0), U32(0x10000), U32(0), U32(0), U32(0), U32(0x40000000));
+const pstr = (s, len) => { const a = [s.length].concat(S4(s)); return len ? a.concat(Z(len - a.length)) : a; };
+function buildMov({ W, H, fps, samples, avcC, pcm, sr }) {
+  const ftyp = B('ftyp', S4('qt  '), U32(0x20050300), S4('qt  '));
+  const vBytes = samples.reduce((a, s) => a + s.data.byteLength, 0), aBytes = pcm ? pcm.byteLength : 0;
+  if (vBytes + aBytes + 16 > 0xFFFFFFF0) throw new Error('Video terlalu besar (>4 GB). Turunkan resolusi atau durasi.');
+  const base = ftyp.length + 8;
+  const N = samples.length, vts = 90000, delta = Math.round(vts / fps), durMs = Math.round(N * 1000 / fps);
+  let off = base; const vOff = [], vSize = [], keys = [];
+  samples.forEach((s, i) => { vOff.push(off); vSize.push(s.data.byteLength); off += s.data.byteLength; if (s.key) keys.push(i + 1); });
+  const hdlr = (ct, st, name) => B('hdlr', U32(0), S4(ct), S4(st), U32(0), U32(0), U32(0), pstr(name));
+  const dinf = B('dinf', B('dref', U32(0), U32(1), B('alis', U32(1))));
+  const tkhd = (id, vol, w, h) => B('tkhd', U32(3), U32(0), U32(0), U32(id), U32(0), U32(durMs), Z(8), U16(0), U16(0), U16(vol), U16(0), MATRIX, U32(w * 65536), U32(h * 65536));
+  const mdhd = (ts, d) => B('mdhd', U32(0), U32(0), U32(0), U32(ts), U32(d), U16(0x55c4), U16(0));
+  const avc1 = B('avc1', Z(6), U16(1), U16(0), U16(0), U32(0), U32(0), U32(512), U16(W), U16(H), U32(0x480000), U32(0x480000), U32(0), U16(1), pstr('H.264', 32), U16(24), U16(0xffff), B('avcC', Array.from(avcC)));
+  let stco = [U32(0), U32(N)]; for (const o of vOff) stco.push(U32(o));
+  let stsz = [U32(0), U32(0), U32(N)]; for (const s of vSize) stsz.push(U32(s));
+  let stss = [U32(0), U32(keys.length)]; for (const k of keys) stss.push(U32(k));
+  const vtrak = B('trak', tkhd(1, 0, W, H), B('mdia', mdhd(vts, N * delta), hdlr('mhlr', 'vide', 'VideoHandler'),
+    B('minf', B('vmhd', U32(1), U16(0), U16(0), U16(0), U16(0)), hdlr('dhlr', 'alis', 'DataHandler'), dinf,
+      B('stbl', B('stsd', U32(0), U32(1), avc1), B('stts', U32(0), U32(1), U32(N), U32(delta)), B('stss', ...stss),
+        B('stsc', U32(0), U32(1), U32(1), U32(1), U32(1)), B('stsz', ...stsz), B('stco', ...stco)))));
+  let atrak = [];
+  if (pcm) {
+    const frames = pcm.length / 2, CH = sr, nCh = Math.max(1, Math.ceil(frames / CH)), last = frames - (nCh - 1) * CH;
+    const stsc = (nCh === 1 || last === CH) ? [U32(0), U32(1), U32(1), U32(nCh === 1 ? frames : CH), U32(1)] : [U32(0), U32(2), U32(1), U32(CH), U32(1), U32(nCh), U32(last), U32(1)];
+    let aco = [U32(0), U32(nCh)]; for (let i = 0; i < nCh; i++) aco.push(U32(off + i * CH * 4));
+    const sowt = B('sowt', Z(6), U16(1), U16(0), U16(0), U32(0), U16(2), U16(16), U16(0), U16(0), U32(sr * 65536));
+    atrak = B('trak', tkhd(2, 0x100, 0, 0), B('mdia', mdhd(sr, frames), hdlr('mhlr', 'soun', 'SoundHandler'),
+      B('minf', B('smhd', U32(0), U16(0), U16(0)), hdlr('dhlr', 'alis', 'DataHandler'), dinf,
+        B('stbl', B('stsd', U32(0), U32(1), sowt), B('stts', U32(0), U32(1), U32(frames), U32(1)),
+          B('stsc', ...stsc), B('stsz', U32(0), U32(4), U32(frames)), B('stco', ...aco)))));
+  }
+  const mvhd = B('mvhd', U32(0), U32(0), U32(0), U32(1000), U32(durMs), U32(0x10000), U16(0x100), Z(10), MATRIX, Z(24), U32(pcm ? 3 : 2));
+  const moov = B('moov', mvhd, vtrak, atrak);
+  const parts = [new Uint8Array(ftyp), new Uint8Array(U32(8 + vBytes + aBytes).concat(S4('mdat')))];
+  samples.forEach(s => parts.push(s.data));
+  if (pcm) parts.push(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength));
+  parts.push(new Uint8Array(moov));
+  return new Blob(parts, { type: 'video/quicktime' });
+}
+// --- UI ekspor ---
 function openExport() {
   if (!S.clips.length) return toast(NOCLIP);
   openSheet('Ekspor', b => {
-    addChips(b, [['720p', '720p (lebih ringan)'], ['1080p', '1080p']], expQuality, v => { expQuality = v; store('ve_q', v); }, 'Resolusi video');
+    const [aw, ah] = sizeFor('asli');
+    addChips(b, [['asli', `Asli (${aw}×${ah})`], ['1080p', '1080p'], ['720p', '720p']], expQuality, v => { expQuality = v; store('ve_q2', v); }, 'Resolusi');
+    addChips(b, [[24, '24 fps'], [30, '30 fps'], [60, '60 fps']], expFps, v => { expFps = v; store('ve_fps', v); }, 'Frame rate');
     addBtn(b, '🎬 Ekspor video', () => { closeSheet(); doExport(false); }, 'btn full acc');
-    addBtn(b, '🎵 Ekspor audio saja', () => { closeSheet(); doExport(true); });
-    addNote(b, 'Ekspor berjalan sesuai durasi proyek (' + fmt(total()) + '). Biarkan layar menyala selama proses.');
+    addBtn(b, '🎵 Ekspor audio saja (WAV)', () => { closeSheet(); doExport(true); });
+    addNote(b, hasEncoder()
+      ? '✅ <b>Mode presisi</b>: video dirender frame demi frame lalu di-encode H.264, jadi hasilnya mulus dan tajam walau iPhone sedang lambat. Lama proses tergantung durasi & resolusi (biasanya 1–3× durasi video). Hasil berformat <b>.MOV</b> (bisa langsung disimpan ke Foto).'
+      : '⚠️ Browser ini belum mendukung mode presisi (butuh iOS 16.4+). Ekspor memakai perekaman real-time — biarkan layar menyala selama proses.');
   });
 }
+function showOverlay(title, info, onCancel) {
+  $('#ovTitle').textContent = title; $('#ovBar').style.width = '0%'; $('#ovInfo').textContent = info;
+  const bb = $('#ovBtns'); bb.innerHTML = '';
+  if (onCancel) { const c = mk('button', { class: 'btn full', text: 'Batal' }); c.onclick = onCancel; bb.appendChild(c); }
+  $('#ov').classList.add('show');
+}
+const setProg = (p, info) => { $('#ovBar').style.width = clamp(p * 100, 0, 100) + '%'; if (info != null) $('#ovInfo').textContent = info; };
+function showResult(blob, name, label, hint) {
+  const url = URL.createObjectURL(blob);
+  $('#ovTitle').textContent = '✅ ' + label + ' siap'; $('#ovBar').style.width = '100%';
+  $('#ovInfo').textContent = (blob.size / 1048576).toFixed(1) + ' MB · ' + name.split('.').pop().toUpperCase() + '. ' + hint;
+  const bb = $('#ovBtns'); bb.innerHTML = '';
+  const file = new File([blob], name, { type: blob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    const sh = mk('button', { class: 'btn full acc', text: 'Bagikan / Simpan' });
+    sh.onclick = () => navigator.share({ files: [file] }).catch(() => { }); bb.appendChild(sh);
+  }
+  bb.appendChild(mk('a', { class: 'btn full', href: url, download: name, text: 'Unduh file', style: 'text-align:center;text-decoration:none;display:block' }));
+  const cl = mk('button', { class: 'btn full', text: 'Tutup' }); cl.onclick = () => { $('#ov').classList.remove('show'); dirty = true; }; bb.appendChild(cl);
+}
+const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
 async function doExport(audioOnly) {
   if (!S.clips.length) return toast(NOCLIP);
+  stopPlay();
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (audioOnly) return OAC ? exportAudioOffline() : doExportRealtime(true);
+  if (hasEncoder()) return exportOffline();
+  return doExportRealtime(false);
+}
+async function exportAudioOffline() {
+  cancelExp = false;
+  showOverlay('Mengekspor audio…', 'Mencampur semua audio…', () => { cancelExp = true; $('#ov').classList.remove('show'); });
+  try {
+    const r = await mixAudio(p => setProg(p * 0.9)); if (!r || cancelExp) return;
+    showResult(wavBlob(toPCM16(r.buf), 48000), 'audio-' + stamp() + '.wav', 'Audio', 'Pilih "Bagikan" lalu "Simpan ke File".' + (r.failed.length ? ' ⚠️ Audio gagal dibaca: ' + r.failed.join(', ') : ''));
+  } catch (e) { $('#ovTitle').textContent = 'Gagal'; $('#ovInfo').textContent = e.message; }
+}
+async function exportOffline() {
+  const [W, H] = sizeFor(expQuality), fps = expFps, tot = total(), N = Math.max(1, Math.round(tot * fps));
+  const bitrate = Math.round(Math.min(50e6, Math.max(4e6, W * H * fps * 0.2)));
+  const cfg = await pickCodec(W, H, fps, bitrate);
+  if (!cfg) { toast(`Resolusi ${W}×${H} @${fps}fps tidak didukung encoder, pakai mode real-time`); return doExportRealtime(false); }
+  cancelExp = false;
+  const prevSel = sel; sel = { type: null, id: null };
+  showOverlay(`Mengekspor ${W}×${H} · ${fps} fps…`, 'Menyiapkan audio…', () => { cancelExp = true; });
+  offline = true; exporting = true;
+  let audio = null, err = null, samples = [], avcC = null;
+  try {
+    try { audio = await mixAudio(p => setProg(p * 0.08)); } catch (e) { console.warn('audio', e); }
+    if (cancelExp) throw new Error('batal');
+    exportSize = [W, H]; resizeOut();
+    let encErr = null;
+    const enc = new VideoEncoder({
+      output: (chunk, meta) => {
+        if (!avcC && meta && meta.decoderConfig && meta.decoderConfig.description) {
+          const d = meta.decoderConfig.description;
+          avcC = d instanceof ArrayBuffer ? new Uint8Array(d.slice(0)) : new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+        }
+        const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); samples.push({ data, key: chunk.type === 'key' });
+      },
+      error: e => { encErr = e; }
+    });
+    enc.configure(cfg);
+    const t0e = performance.now();
+    for (let i = 0; i < N; i++) {
+      if (cancelExp) throw new Error('batal');
+      if (encErr) throw encErr;
+      T = Math.min(i / fps, Math.max(0, tot - 1e-4));
+      const a = clipAt(T);
+      if (a) { const m = media[a.c.mediaId]; if (m && m.type === 'video' && !m.error) await seekExact(m.el, a.c.in + (T - a.start) * a.c.speed); }
+      render();
+      const vf = new VideoFrame(out, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps), alpha: 'discard' });
+      enc.encode(vf, { keyFrame: i % (fps * 2) === 0 }); vf.close();
+      while (enc.encodeQueueSize > 3) await new Promise(r => setTimeout(r, 2));
+      if (i % 4 === 0) {
+        const el = (performance.now() - t0e) / 1000, eta = el / (i + 1) * (N - i - 1);
+        setProg(0.08 + 0.9 * (i + 1) / N, `Frame ${i + 1} / ${N} · sisa ± ${Math.ceil(eta)} dtk. Biarkan layar menyala & jangan pindah aplikasi.`);
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    await enc.flush(); enc.close();
+    if (encErr) throw encErr;
+    if (!avcC) throw new Error('Encoder tidak memberikan konfigurasi H.264');
+    setProg(0.99, 'Menyusun file…');
+    const pcm = audio ? toPCM16(audio.buf) : null;
+    const blob = buildMov({ W, H, fps, samples, avcC, pcm, sr: 48000 });
+    samples = null;
+    showResult(blob, 'video-' + stamp() + '.mov', 'Video ' + W + '×' + H, 'Pilih "Bagikan" lalu "Simpan Video" agar masuk ke Foto.' + (audio && audio.failed.length ? ' ⚠️ Audio tidak terbaca dari: ' + audio.failed.join(', ') : '') + (!audio ? ' ⚠️ Audio tidak bisa dimix di browser ini.' : ''));
+  } catch (e) {
+    err = e;
+    if (e.message === 'batal') $('#ov').classList.remove('show');
+    else { $('#ovTitle').textContent = 'Ekspor gagal'; $('#ovInfo').textContent = (e.message || e) + ' — coba resolusi lebih kecil.'; const bb = $('#ovBtns'); bb.innerHTML = ''; const c = mk('button', { class: 'btn full', text: 'Tutup' }); c.onclick = () => $('#ov').classList.remove('show'); bb.appendChild(c); }
+  } finally {
+    offline = false; exporting = false; exportSize = null; sel = prevSel; resizeOut(); seekTo(0); syncScroll(); dirty = true;
+  }
+}
+// --- Cadangan: perekaman real-time ---
+function waitSeek() { return new Promise(r => { const a = clipAt(0); const m = a && media[a.c.mediaId]; if (!m || m.type !== 'video' || !m.el.seeking) return setTimeout(r, 150); m.el.addEventListener('seeked', () => setTimeout(r, 80), { once: true }); setTimeout(r, 2000); }); }
+async function doExportRealtime(audioOnly) {
   if (!window.MediaRecorder || (!audioOnly && !out.captureStream)) return alert('Browser ini belum mendukung ekspor. Gunakan Safari iOS 14.5 atau lebih baru.');
   initAudio(); unlockAll(); stopPlay();
   if (audioOnly && !dest) return alert('Ekspor audio tidak didukung di browser ini.');
   expAudioOnly = audioOnly;
-  const cands = audioOnly ? ['audio/mp4', 'audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/webm']
-    : ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  const cands = audioOnly ? ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'] : ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'];
   recMime = cands.find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (e) { return false; } }) || '';
-  if (!audioOnly) { renderScale = expQuality === '1080p' ? 1.5 : 1; resizeOut(); }
+  const [W, H] = sizeFor(expQuality === 'asli' ? '1080p' : expQuality);
+  if (!audioOnly) { exportSize = [W, H]; resizeOut(); }
   const tracks = audioOnly ? [] : [...out.captureStream(30).getVideoTracks()];
   if (dest) tracks.push(...dest.stream.getAudioTracks());
-  const opts = audioOnly ? { audioBitsPerSecond: 192000 } : { videoBitsPerSecond: expQuality === '1080p' ? 12e6 : 8e6, audioBitsPerSecond: 192000 };
+  const opts = audioOnly ? {} : { videoBitsPerSecond: Math.round(Math.min(25e6, W * H * 30 * 0.2)) };
   if (recMime) opts.mimeType = recMime;
   try { rec = new MediaRecorder(new MediaStream(tracks), opts); }
-  catch (e) { try { rec = new MediaRecorder(new MediaStream(tracks)); } catch (e2) { renderScale = 1; resizeOut(); return alert('Gagal memulai ekspor: ' + e2.message); } }
+  catch (e) { try { rec = new MediaRecorder(new MediaStream(tracks)); } catch (e2) { exportSize = null; resizeOut(); return alert('Gagal memulai ekspor: ' + e2.message); } }
   chunks = []; rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); }; rec.onstop = onRecStop;
   const prevSel = sel; sel = { type: null, id: null };
-  $('#ovTitle').textContent = audioOnly ? 'Mengekspor audio…' : 'Mengekspor video ' + expQuality + '…'; $('#ovBar').style.width = '0%';
-  $('#ovInfo').textContent = 'Biarkan layar tetap menyala dan jangan pindah aplikasi. Ekspor berjalan sesuai durasi (' + fmt(total()) + ').';
-  const bb = $('#ovBtns'); bb.innerHTML = '';
-  const cancel = mk('button', { class: 'btn full', text: 'Batal' });
-  cancel.onclick = () => { exporting = false; stopPlay(); rec.onstop = null; try { rec.stop(); } catch (e) { } renderScale = 1; resizeOut(); $('#ov').classList.remove('show'); sel = prevSel; dirty = true; };
-  bb.appendChild(cancel); $('#ov').classList.add('show');
+  showOverlay('Merekam (mode real-time)…', 'Biarkan layar menyala. Proses berjalan sesuai durasi (' + fmt(total()) + ').', () => { exporting = false; stopPlay(); rec.onstop = null; try { rec.stop(); } catch (e) { } exportSize = null; resizeOut(); $('#ov').classList.remove('show'); sel = prevSel; dirty = true; });
   seekTo(0); syncScroll(); await waitSeek(); render();
   exporting = true; rec.start(500); startPlay();
 }
 function finishExport() { exporting = false; setTimeout(() => { try { rec.stop(); } catch (e) { } }, 350); }
 function onRecStop() {
-  renderScale = 1; resizeOut(); dirty = true;
+  exportSize = null; resizeOut(); dirty = true;
   const type = (rec && rec.mimeType) || recMime || (expAudioOnly ? 'audio/mp4' : 'video/mp4');
-  const blob = new Blob(chunks, { type });
   const ext = expAudioOnly ? (type.includes('mp4') ? 'm4a' : 'webm') : (type.includes('mp4') ? 'mp4' : 'webm');
-  const name = (expAudioOnly ? 'audio-' : 'video-') + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.' + ext;
-  const url = URL.createObjectURL(blob);
-  $('#ovTitle').textContent = expAudioOnly ? '✅ Audio siap' : '✅ Video siap'; $('#ovBar').style.width = '100%';
-  $('#ovInfo').textContent = (blob.size / 1048576).toFixed(1) + ' MB · ' + ext.toUpperCase() + '. ' + (expAudioOnly ? 'Pilih "Bagikan" lalu "Simpan ke File".' : 'Di iPhone pilih "Bagikan" lalu "Simpan Video" agar masuk ke Foto.');
-  const bb = $('#ovBtns'); bb.innerHTML = '';
-  const file = new File([blob], name, { type });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    const sh = mk('button', { class: 'btn full acc', text: expAudioOnly ? 'Bagikan / Simpan ke File' : 'Bagikan / Simpan ke Foto' });
-    sh.onclick = () => navigator.share({ files: [file] }).catch(() => { }); bb.appendChild(sh);
-  }
-  const a = mk('a', { class: 'btn full', href: url, download: name, text: 'Unduh file', style: 'text-align:center;text-decoration:none;display:block' }); bb.appendChild(a);
-  const cl = mk('button', { class: 'btn full', text: 'Tutup' }); cl.onclick = () => { $('#ov').classList.remove('show'); dirty = true; }; bb.appendChild(cl);
+  showResult(new Blob(chunks, { type }), (expAudioOnly ? 'audio-' : 'video-') + stamp() + '.' + ext, expAudioOnly ? 'Audio' : 'Video', 'Pilih "Bagikan" lalu simpan.');
 }
 
 /* ============ Init ============ */
