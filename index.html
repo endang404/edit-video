@@ -38,6 +38,11 @@ header h1{font-size:16px;margin:0 0 0 4px;flex:1;font-weight:700}
 .trk.txt{top:84px;background:#6d43e8}
 .trk.mus{background:#1f8f4e}
 .trk.mus.ex{background:#2a6fdb}
+.trk.mus.sfx{background:#b7791f}
+.sfxrow{display:flex;align-items:center;gap:8px;background:#222;border-radius:12px;padding:8px 10px;margin:8px 0}
+.sfxrow b{flex:1;font-size:14px;font-weight:600}
+.sfxrow .ico{font-size:22px}
+.sfxrow .btn{padding:9px 12px}
 .trk.sel{border-color:#fff}
 .addbtn{position:absolute;top:32px;width:36px;height:36px;border-radius:8px;background:#fff;color:#000;border:0;font-size:22px;font-weight:700;line-height:36px;padding:0}
 nav#tools{display:flex;overflow-x:auto;gap:0;padding:8px 4px;background:#0f0f0f;border-top:1px solid var(--line);scrollbar-width:none;flex:0 0 auto}
@@ -688,12 +693,12 @@ function buildTimeline() {
   });
   S.music.forEach(mu => {
     const d = document.createElement('div'), w = Math.max(16, adur(mu) * pps);
-    d.className = 'trk mus' + (mu.kind === 'ekstrak' ? ' ex' : '') + (sel.type === 'music' && sel.id === mu.id ? ' sel' : '');
+    d.className = 'trk mus' + (mu.kind === 'ekstrak' ? ' ex' : mu.kind === 'sfx' ? ' sfx' : '') + (sel.type === 'music' && sel.id === mu.id ? ' sel' : '');
     d.style.top = (112 + Math.min(lane[mu.id], 3) * 28) + 'px';
     d.style.left = (pad + mu.start * pps) + 'px'; d.style.width = w + 'px';
     const fi = clamp(mu.fadeIn * pps / w * 100, 0, 50), fo = clamp(mu.fadeOut * pps / w * 100, 0, 50);
     if (fi || fo) d.style.backgroundImage = `linear-gradient(to right, rgba(0,0,0,.55) 0%, transparent ${fi}%, transparent ${100 - fo}%, rgba(0,0,0,.55) 100%)`;
-    d.textContent = (mu.kind === 'ekstrak' ? '' : '♪ ') + (mu.name || 'Audio') + (mu.speed !== 1 ? ' · ' + mu.speed + 'x' : '');
+    d.textContent = (mu.kind === 'ekstrak' || mu.kind === 'sfx' ? '' : '♪ ') + (mu.name || 'Audio') + (mu.speed !== 1 ? ' · ' + mu.speed + 'x' : '');
     d.onclick = e => { e.stopPropagation(); select('music', mu.id); };
     inner.appendChild(d);
   });
@@ -788,6 +793,7 @@ function openSheet(title, build) {
 }
 function refreshSheet() { const b = $('#sheetBody'); const st = b.scrollTop; b.innerHTML = ''; sheetBuild && sheetBuild(b); b.scrollTop = st; }
 function closeSheet() {
+  if (typeof stopSfxPreview === 'function') stopSfxPreview();
   $('#sheet').classList.remove('open'); sheetBuild = null;
   if (undoStack.length && undoStack[undoStack.length - 1] === snap()) undoStack.pop();
   updUndo(); if (document.activeElement) document.activeElement.blur();
@@ -1062,6 +1068,7 @@ function openText() {
 function openAudioMenu() {
   openSheet('Tambah audio', b => {
     addBtn(b, '♪ Audio dari perangkat (Files: MP3, M4A, WAV…)', () => { closeSheet(); $('#fileAud').click(); }, 'btn full acc');
+    addBtn(b, '🌿 Efek suara alam (air terjun, sungai, burung…)', () => { closeSheet(); openSfx(); });
     addBtn(b, '🎞 Ekstrak audio dari video di galeri', () => { closeSheet(); $('#fileAudVid').click(); });
     const c = getClip();
     if (c && media[c.mediaId].type === 'video') addBtn(b, '🎞 Ekstrak audio dari ' + clipLabel(c) + ' (timeline)', () => { closeSheet(); doExtract(); });
@@ -1115,6 +1122,177 @@ function openRatio() {
   });
 }
 
+/* ============ Efek suara alam (sintesis prosedural, bebas hak cipta) ============ */
+const SR_SFX = 48000;
+function rngf(seed) { let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+class BQ {
+  constructor(type, f, q = 0.707) { this.x1 = this.x2 = this.y1 = this.y2 = 0; this.set(type, f, q); }
+  set(type, f, q = 0.707) {
+    const w = 2 * Math.PI * Math.min(f, SR_SFX * 0.45) / SR_SFX, c = Math.cos(w), s = Math.sin(w), al = s / (2 * q); let b0, b1, b2;
+    if (type === 'lp') { b0 = (1 - c) / 2; b1 = 1 - c; b2 = b0; } else if (type === 'hp') { b0 = (1 + c) / 2; b1 = -(1 + c); b2 = b0; } else { b0 = al; b1 = 0; b2 = -al; }
+    const a0 = 1 + al; this.b0 = b0 / a0; this.b1 = b1 / a0; this.b2 = b2 / a0; this.a1 = -2 * c / a0; this.a2 = (1 - al) / a0;
+  }
+  p(x) { const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2; this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y; return y; }
+}
+function pinkGen(r) { let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0; return () => { const w = r() * 2 - 1; b0 = .99886 * b0 + w * .0555179; b1 = .99332 * b1 + w * .0750759; b2 = .969 * b2 + w * .153852; b3 = .8665 * b3 + w * .3104856; b4 = .55 * b4 + w * .5329522; b5 = -.7616 * b5 - w * .016898; const o = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * .5362; b6 = w * .115926; return o * .11; }; }
+function brownGen(r) { let l = 0; return () => { l = (l + 0.02 * (r() * 2 - 1)) / 1.02; return l * 3.5; }; }
+function lfo(r, rate) { let v = r(), tgt = r(), ph = 0; const inc = rate / SR_SFX; return () => { ph += inc; if (ph >= 1) { ph -= 1; v = tgt; tgt = r(); } const k = ph * ph * (3 - 2 * ph); return v + (tgt - v) * k; }; }
+const expT = (r, rate) => -Math.log(1 - r() * 0.9999) / rate; // jeda acak (Poisson)
+function addSt(L, R, start, len, fn, pan = 0) {
+  const gl = Math.cos((pan + 1) * Math.PI / 4), gr = Math.sin((pan + 1) * Math.PI / 4);
+  for (let i = 0; i < len; i++) { const j = start + i; if (j >= L.length) break; const v = fn(i); if (j >= 0) { L[j] += v * gl; R[j] += v * gr; } }
+}
+function noiseBurst(L, R, r, at, lenS, f, q, amp, decay, pan) {
+  const len = Math.max(8, Math.floor(lenS * SR_SFX)), bp = new BQ('bp', f, q);
+  addSt(L, R, Math.floor(at * SR_SFX), len, i => bp.p(r() * 2 - 1) * amp * Math.exp(-i / (decay * SR_SFX)), pan);
+}
+function tone(L, R, at, lenS, f0, f1, amp, pan, harm = 0.2, vib = 0) {
+  const len = Math.floor(lenS * SR_SFX); let ph = 0;
+  addSt(L, R, Math.floor(at * SR_SFX), len, i => {
+    const k = i / len, f = f0 * Math.pow(f1 / f0, k) * (1 + vib * Math.sin(i / SR_SFX * 2 * Math.PI * 28));
+    ph += 2 * Math.PI * f / SR_SFX; const env = Math.pow(Math.sin(Math.PI * k), 0.6);
+    return (Math.sin(ph) + harm * Math.sin(2 * ph)) * env * amp;
+  }, pan);
+}
+function genWaterfall(n, r) {
+  const L = new Float32Array(n), R = new Float32Array(n);
+  [L, R].forEach(buf => {
+    const pk = pinkGen(r), br = brownGen(r), lp = new BQ('lp', 2600, 0.7), hp = new BQ('hp', 45), lp2 = new BQ('lp', 200), hh = new BQ('bp', 6500, 0.8), m = lfo(r, 0.6), m2 = lfo(r, 2.5);
+    for (let i = 0; i < n; i++) buf[i] = hp.p(lp.p(pk())) * (0.8 + 0.2 * m()) + lp2.p(br()) * 0.8 + hh.p(r() * 2 - 1) * 0.1 * (0.85 + 0.15 * m2());
+  });
+  return [L, R];
+}
+function genRiver(n, r) {
+  const L = new Float32Array(n), R = new Float32Array(n), dur = n / SR_SFX;
+  [L, R].forEach(buf => {
+    const pk = pinkGen(r), bp = new BQ('bp', 650, 0.5), hs = new BQ('bp', 3200, 0.7), m = lfo(r, 1.8), m2 = lfo(r, 6);
+    for (let i = 0; i < n; i++) buf[i] = bp.p(pk()) * (0.35 + 0.25 * m()) + hs.p(r() * 2 - 1) * 0.025 * m2();
+  });
+  for (let t = 0; t < dur; t += expT(r, 30)) { // gelembung & gemericik
+    const f0 = 280 + Math.pow(r(), 2) * 1500, rise = 1.4 + r() * 2.6, len = 0.012 + r() * 0.05, amp = 0.04 + Math.pow(r(), 2) * 0.22;
+    tone(L, R, t, len, f0, f0 * rise, amp, r() * 1.6 - 0.8, 0);
+  }
+  return [L, R];
+}
+function genBirds(n, r) {
+  const L = new Float32Array(n), R = new Float32Array(n), dur = n / SR_SFX;
+  [L, R].forEach(buf => { const pk = pinkGen(r), lp = new BQ('lp', 1100), rs = new BQ('bp', 2800, 0.8), m = lfo(r, 0.3); for (let i = 0; i < n; i++) buf[i] = lp.p(pk()) * 0.05 + rs.p(r() * 2 - 1) * 0.012 * m(); });
+  const species = ['siul', 'trill', 'cicit', 'kukur', 'siul', 'cicit', 'trill', 'siul'];
+  species.forEach((sp, vi) => {
+    const pan = r() * 1.8 - 0.9, dist = 0.25 + r() * 0.75, base = 0.85 + r() * 0.3;
+    for (let t = r() * 2.5; t < dur - 0.5; t += 1.2 + r() * 3.8) {
+      const a = 0.35 * dist;
+      if (sp === 'siul') { const k = 2 + Math.floor(r() * 2); for (let j = 0; j < k; j++) tone(L, R, t + j * 0.26, 0.18, 2300 * base, 3300 * base * (j === k - 1 ? 1.15 : 1), a, pan, 0.15, 0.01); }
+      else if (sp === 'trill') { const k = 8 + Math.floor(r() * 8); for (let j = 0; j < k; j++) tone(L, R, t + j * 0.05, 0.035, (4300 + (j % 2 ? 300 : -200)) * base, 4100 * base, a * 0.8, pan, 0.1); }
+      else if (sp === 'cicit') { const k = 3 + Math.floor(r() * 4); for (let j = 0; j < k; j++) tone(L, R, t + j * 0.12, 0.05, 6200 * base, 3600 * base, a * 0.7, pan, 0.1); }
+      else { for (let j = 0; j < 3; j++) tone(L, R, t + j * 0.42, j === 1 ? 0.38 : 0.26, (j === 1 ? 680 : 760) * base, (j === 1 ? 600 : 720) * base, a * 0.9, pan, 0.05); t += 2; }
+    }
+  });
+  return [L, R];
+}
+function genCrickets(n, r) {
+  const L = new Float32Array(n), R = new Float32Array(n), dur = n / SR_SFX;
+  [L, R].forEach(buf => {
+    const br = brownGen(r), lp = new BQ('lp', 220), bz = new BQ('bp', 7200, 5), m = lfo(r, 0.15); let ph = r() * 6;
+    for (let i = 0; i < n; i++) { ph += 2 * Math.PI * 46 / SR_SFX; const am = Math.pow(0.5 + 0.5 * Math.sin(ph), 3); buf[i] = lp.p(br()) * 0.12 + bz.p(r() * 2 - 1) * am * 0.5 * (0.3 + 0.7 * m()); }
+  });
+  const cnt = 4 + Math.floor(r() * 3);
+  for (let c = 0; c < cnt; c++) {
+    const f = 3900 + r() * 1300, pl = 0.012 + r() * 0.008, pg = 0.02 + r() * 0.012, np = 3 + Math.floor(r() * 2), per = 0.3 + r() * 0.4, amp = 0.15 + r() * 0.35, pan = r() * 1.8 - 0.9;
+    for (let t = r() * per; t < dur; t += per * (0.95 + r() * 0.1)) {
+      if (r() < 0.02) { t += 2 + r() * 3; continue; }
+      for (let p = 0; p < np; p++) { const st = Math.floor((t + p * (pl + pg)) * SR_SFX), len = Math.floor(pl * SR_SFX); addSt(L, R, st, len, i => Math.sin(2 * Math.PI * f * i / SR_SFX) * Math.sin(Math.PI * i / len) * amp, pan); }
+    }
+  }
+  // satu jangkrik "trill" panjang di kejauhan
+  const f2 = 2900 + r() * 400, pan2 = r() * 1.6 - 0.8;
+  for (let t = r() * 3; t < dur; t += 3 + r() * 4) {
+    const len = Math.floor((1.5 + r() * 3) * SR_SFX), st = Math.floor(t * SR_SFX);
+    addSt(L, R, st, len, i => { const k = i / len; return Math.sin(2 * Math.PI * f2 * i / SR_SFX) * Math.pow(Math.max(0, Math.sin(2 * Math.PI * 55 * i / SR_SFX)), 2) * 0.12 * Math.min(1, k * 8, (1 - k) * 8); }, pan2);
+  }
+  return [L, R];
+}
+function genFire(n, r) {
+  const L = new Float32Array(n), R = new Float32Array(n), dur = n / SR_SFX;
+  [L, R].forEach(buf => {
+    const br = brownGen(r), lp = new BQ('lp', 380), hp = new BQ('hp', 2500), m = lfo(r, 1.4), m2 = lfo(r, 4);
+    for (let i = 0; i < n; i++) buf[i] = lp.p(br()) * (0.45 + 0.4 * m()) + hp.p(r() * 2 - 1) * 0.02 * m2();
+  });
+  for (let t = 0; t < dur; t += expT(r, 14)) { // gemeretak
+    const k = 1 + Math.floor(r() * 5), amp = 0.06 + Math.pow(r(), 3) * 0.7, pan = r() * 1.4 - 0.7;
+    for (let j = 0; j < k; j++) noiseBurst(L, R, r, t + r() * 0.015, 0.004 + r() * 0.004, 1200 + r() * 4000, 1.2, amp * (0.5 + r() * 0.5), 0.0012 + r() * 0.002, pan);
+  }
+  for (let t = r(); t < dur; t += expT(r, 0.3)) noiseBurst(L, R, r, t, 0.03, 600 + r() * 900, 2.5, 1.1, 0.006, r() * 1.2 - 0.6); // letupan kayu
+  return [L, R];
+}
+function genSteps(n, r) {
+  const L = new Float32Array(n), R = new Float32Array(n), dur = n / SR_SFX;
+  [L, R].forEach(buf => { const pk = pinkGen(r), lp = new BQ('lp', 900); for (let i = 0; i < n; i++) buf[i] = lp.p(pk()) * 0.05; });
+  let side = 1;
+  for (let t = 0.3 + r() * 0.2; t < dur - 0.3; t += 0.52 + r() * 0.08) {
+    if (t > 3 && r() < 0.05) { t += 1 + r() * 1.5; continue; }
+    side = -side; const pan = side * 0.2;
+    [[0, 1], [0.07 + r() * 0.03, 0.6]].forEach(([dt, a]) => {
+      const at = t + dt, st = Math.floor(at * SR_SFX), tl = Math.floor(0.07 * SR_SFX), f = 65 + r() * 25, br = brownGen(r), lp = new BQ('lp', 260);
+      addSt(L, R, st, tl, i => (Math.sin(2 * Math.PI * f * i / SR_SFX) * 0.35 + lp.p(br()) * 0.6) * a * Math.exp(-i / (0.018 * SR_SFX)), pan);
+      const g = 30 + Math.floor(r() * 35);
+      for (let j = 0; j < g; j++) { const off = -Math.log(1 - r() * 0.95) * 0.04; noiseBurst(L, R, r, at + off, 0.002 + r() * 0.004, 700 + r() * 3800, 1.5, a * (0.08 + r() * 0.35) * Math.exp(-off / 0.07), 0.0015, pan); }
+    });
+    if (r() < 0.12) { const at = t + 0.03; noiseBurst(L, R, r, at, 0.004, 3000, 0.8, 0.6, 0.001, pan); tone(L, R, at, 0.03, 2400 + r() * 1200, 2200, 0.15, pan, 0); }
+  }
+  return [L, R];
+}
+const SFX = {
+  waterfall: { name: 'Air terjun', icon: '🏞️', gen: genWaterfall, vol: 0.7 },
+  river:     { name: 'Air sungai', icon: '🌊', gen: genRiver, vol: 0.8 },
+  birds:     { name: 'Cuitan burung di hutan', icon: '🐦', gen: genBirds, vol: 0.8 },
+  crickets:  { name: 'Serangga & jangkrik malam', icon: '🦗', gen: genCrickets, vol: 0.7 },
+  campfire:  { name: 'Api unggun', icon: '🔥', gen: genFire, vol: 0.8 },
+  footsteps: { name: 'Langkah kaki di hutan', icon: '👣', gen: genSteps, vol: 0.9 },
+};
+function makeSfx(key, sec) {
+  const n = Math.max(SR_SFX, Math.round(sec * SR_SFX)), r = rngf((Math.random() * 4294967296) >>> 0);
+  const [L, R] = SFX[key].gen(n, r);
+  let pk = 1e-9; for (let i = 0; i < n; i++) { const a = Math.abs(L[i]), b = Math.abs(R[i]); if (a > pk) pk = a; if (b > pk) pk = b; }
+  const k = 0.85 / pk, fd = Math.floor(0.02 * SR_SFX), pcm = new Int16Array(n * 2);
+  for (let i = 0; i < n; i++) { const e = Math.min(1, i / fd, (n - 1 - i) / fd); pcm[2 * i] = clamp(L[i] * k * e, -1, 1) * 32767; pcm[2 * i + 1] = clamp(R[i] * k * e, -1, 1) * 32767; }
+  return URL.createObjectURL(wavBlob(pcm, SR_SFX));
+}
+async function addSfx(key, sec, start, vol) {
+  const s = SFX[key]; if (!s) return null;
+  const m = await newAudioMedia(makeSfx(key, sec), s.name + '.wav');
+  if (m.error) { toast('Gagal membuat suara'); return null; }
+  const mu = normAudio({ id: uid(), mediaId: m.id, name: s.icon + ' ' + s.name, start, in: 0, out: Math.min(sec, m.duration || sec), volume: vol == null ? s.vol : vol, fadeIn: 0.5, fadeOut: 0.8, kind: 'sfx' });
+  S.music.push(mu); return mu;
+}
+let sfxDur = 'video', sfxPrev = null;
+const sfxSeconds = start => sfxDur === 'video' ? clamp(total() - start, 3, 180) : sfxDur;
+function stopSfxPreview() { if (sfxPrev) { sfxPrev.pause(); sfxPrev = null; } }
+function openSfx() {
+  openSheet('🌿 Efek suara alam', b => {
+    addChips(b, [['video', 'Sepanjang video'], [5, '5 dtk'], [10, '10 dtk'], [20, '20 dtk'], [30, '30 dtk'], [60, '60 dtk']], sfxDur, v => sfxDur = v, 'Durasi');
+    Object.entries(SFX).forEach(([key, s]) => {
+      const pv = mk('button', { class: 'btn', text: '▶' }), add = mk('button', { class: 'btn acc', text: '+ Tambah' });
+      pv.onclick = () => {
+        if (sfxPrev && sfxPrev._key === key) { stopSfxPreview(); pv.textContent = '▶'; return; }
+        stopSfxPreview(); b.querySelectorAll('.sfxrow .btn:not(.acc)').forEach(x => x.textContent = '▶');
+        const a = new Audio(makeSfx(key, 6)); a._key = key; a.play().catch(() => { }); sfxPrev = a; pv.textContent = '■';
+        a.onended = () => { pv.textContent = '▶'; if (sfxPrev === a) sfxPrev = null; };
+      };
+      add.onclick = async () => {
+        stopSfxPreview(); if (playing) stopPlay();
+        const tot = total(), start = T >= tot - 0.5 ? 0 : T;
+        add.disabled = true; add.textContent = '…';
+        const mu = await addSfx(key, sfxSeconds(start), start);
+        add.disabled = false; add.textContent = '+ Tambah';
+        if (mu) { changed(); toast(s.icon + ' ' + s.name + ' ditambahkan di ' + fmt(start)); }
+      };
+      b.appendChild(mk('div', { class: 'sfxrow' }, [mk('span', { class: 'ico', text: s.icon }), mk('b', { text: s.name }), pv, add]));
+    });
+    addNote(b, 'Suara dibuat langsung oleh aplikasi (sintesis), jadi bebas hak cipta dan tiap kali ditambahkan hasilnya sedikit berbeda. Ditaruh mulai dari posisi playhead dan bisa ditumpuk, misalnya sungai + burung + langkah kaki. Ketuk bloknya di timeline lalu alat <b>Audio</b> untuk atur volume, pudar, dan durasi.');
+  });
+}
+
 /* ============ AI ============ */
 const DEFAULT_MODEL = 'claude-sonnet-5-5';
 const getKey = () => store('ve_key') || '';
@@ -1152,10 +1330,11 @@ Operasi audio (lihat daftar "audio" di state):
 {"op":"extractAudio","clip":0}                 // pisahkan audio klip video ke jalur audio sendiri (klip video jadi bisu)
 {"op":"audio","id":"<id>","volume":0.5,"fadeIn":2,"fadeOut":3,"speed":1,"start":0}  // ubah item audio; semua field opsional. "id":"all" untuk semua audio
 {"op":"deleteAudio","id":"<id>"}
+{"op":"addSfx","type":"birds","start":0,"duration":10,"volume":0.8}  // tambah efek suara alam (dibuat otomatis). type: waterfall (air terjun), river (air sungai), birds (cuitan burung di hutan), crickets (serangga & jangkrik malam), campfire (api unggun), footsteps (langkah kaki di hutan). duration default = sampai akhir video. Boleh ditumpuk beberapa
 
 Aturan:
 - Gunakan state proyek (durasi, urutan klip, teks, audio) untuk menghitung waktu dengan tepat.
-- Pengguna tidak bisa menambah file audio baru lewat AI; jika diminta, sarankan memakai alat "Audio" > "Audio dari perangkat".
+- Pengguna tidak bisa menambah file lagu/audio dari perangkat lewat AI (sarankan alat "Audio" > "Audio dari perangkat"), tetapi efek suara alam bisa ditambahkan dengan addSfx. Pilih efek yang cocok dengan suasana video bila diminta.
 - Jika perintah tidak bisa dilakukan (mis. hapus objek, ganti latar belakang, suara AI, subtitle otomatis dari suara), jelaskan jujur di "reply", beri alternatif terdekat, dan "ops": [] untuk bagian itu.
 - Jika gambar frame disertakan, gunakan untuk memahami isi video (judul/caption yang cocok, pilihan filter, warna teks).
 - Jangan menghapus/memotong lebih dari yang diminta. Untuk teks panjang, pecah baris dengan \\n.
@@ -1222,6 +1401,8 @@ function localAI(p) {
     const inn = /masuk|\bin\b|awal/.test(s), outt = /keluar|\bout\b|akhir/.test(s);
     const o = { op: 'animation', clip: 'all' }; if (inn || !outt) { o.in = 'fade'; o.inDuration = 0.6; } if (outt || !inn) { o.out = 'fade'; o.outDuration = 0.6; } ops.push(o);
   }
+  const sfxMap = [[/air ?terjun|waterfall/, 'waterfall'], [/sungai|river|gemericik/, 'river'], [/burung|bird|kicau|cuit/, 'birds'], [/jangkrik|serangga|cricket|malam/, 'crickets'], [/api unggun|\bapi\b|campfire|perapian/, 'campfire'], [/langkah|footstep|jalan kaki/, 'footsteps']];
+  if (/suara|efek|sfx|tambah/.test(s)) for (const [re, k] of sfxMap) if (re.test(s)) { const d = num(/(\d+)\s*(?:detik|dtk)\b(?!\s*(?:pertama|awal|terakhir|akhir))/); const o = { op: 'addSfx', type: k, start: 0 }; if (d) o.duration = d; ops.push(o); }
   if (/penuh|full ?screen|isi layar/.test(s)) ops.push({ op: 'transform', clip: 'all', fit: 'cover' });
   if (/cermin|mirror|flip/.test(s)) ops.push({ op: 'transform', clip: 'selected', flipH: true });
   const rot = num(/putar\s*(-?\d+)/); if (rot != null) ops.push({ op: 'transform', clip: 'selected', rotation: rot });
@@ -1273,6 +1454,7 @@ async function applyOps(ops) {
         case 'deleteText': S.texts = o.id === 'all' ? [] : S.texts.filter(x => x.id !== o.id); log.push('Aa Hapus teks'); break;
         case 'extractAudio': for (const c of cs()) { if (media[c.mediaId].type === 'video' && await extractAudio(c, true)) log.push('🎞 Ekstrak audio ' + clipLabel(c)); } break;
         case 'audio': case 'music': auds().forEach(mu => { if (o.volume != null) mu.volume = nm(o.volume, 0, 2, mu.volume); if (o.start != null) mu.start = nm(o.start, 0, 9999, mu.start); if (o.speed != null) mu.speed = nm(o.speed, 0.1, 10, mu.speed); const h = adur(mu) / 2; if (o.fadeIn != null) mu.fadeIn = nm(o.fadeIn, 0, h, mu.fadeIn); if (o.fadeOut != null) mu.fadeOut = nm(o.fadeOut, 0, h, mu.fadeOut); }); log.push('♪ Ubah audio' + (o.fadeIn || o.fadeOut ? ' (pudar)' : '')); break;
+        case 'addSfx': { if (SFX[o.type]) { const tot = total(), st = nm(o.start, 0, Math.max(0, tot - 0.5), 0), sec = nm(o.duration, 1, 180, clamp(tot - st, 3, 180)); if (await addSfx(o.type, sec, st, o.volume != null ? nm(o.volume, 0, 2, 0.8) : null)) log.push(SFX[o.type].icon + ' ' + SFX[o.type].name + ' (' + fmt(st) + ', ' + Math.round(sec) + ' dtk)'); } break; }
         case 'deleteAudio': case 'deleteMusic': S.music = o.id === 'all' ? [] : S.music.filter(x => x.id !== o.id); log.push('♪ Hapus audio'); break;
       }
     } catch (e) { console.warn('op gagal', o, e); }
@@ -1299,7 +1481,7 @@ function renderChat(box) {
 function openAI() {
   openSheet('✨ AI Edit', b => {
     const chat = mk('div', { id: 'chat' }); b.appendChild(chat); renderChat(chat);
-    const ex = [['Filter film', 'Pakai filter film yang cocok dengan suasana videonya'], ['Pudar masuk & keluar', 'Beri animasi pudar masuk 1 detik di awal video dan pudar keluar 1 detik di akhir'], ['Slow motion', 'Buat klip pertama jadi slow motion 0.5x'], ['Ekstrak + pudar audio', 'Ekstrak audio semua klip lalu beri pudar masuk 1 detik dan pudar keluar 2 detik'], ['Judul otomatis', 'Lihat videonya lalu buat judul pendek yang menarik di 3 detik pertama'], ['Format Reels', 'Ubah ke 9:16 untuk Reels dan isi layar penuh']];
+    const ex = [['Filter film', 'Pakai filter film yang cocok dengan suasana videonya'], ['Pudar masuk & keluar', 'Beri animasi pudar masuk 1 detik di awal video dan pudar keluar 1 detik di akhir'], ['Slow motion', 'Buat klip pertama jadi slow motion 0.5x'], ['Ekstrak + pudar audio', 'Ekstrak audio semua klip lalu beri pudar masuk 1 detik dan pudar keluar 2 detik'], ['Judul otomatis', 'Lihat videonya lalu buat judul pendek yang menarik di 3 detik pertama'], ['Format Reels', 'Ubah ke 9:16 untuk Reels dan isi layar penuh'], ['Suasana hutan', 'Lihat videonya lalu tambahkan efek suara alam yang cocok, misalnya sungai, burung, atau langkah kaki']];
     const exw = mk('div', { class: 'chips' });
     const ta = mk('textarea', { rows: 2, placeholder: 'Ketik perintah edit…' });
     ex.forEach(([l, p]) => { const c = mk('button', { class: 'chip', text: l }); c.onclick = () => { ta.value = p; ta.focus(); }; exw.appendChild(c); });
@@ -1647,7 +1829,7 @@ const TOOLS = [
   ['ai', '✨', 'AI', openAI], ['media', '＋', 'Media', () => $('#fileVid').click()], ['split', '✂︎', 'Belah', doSplit],
   ['trim', '↔', 'Potong', openTrim], ['speed', '⏩', 'Kecepatan', openSpeed], ['transform', '⤢', 'Transformasi', openTransform],
   ['anim', '✦', 'Animasi', openAnim], ['filter', '🎞', 'Filter', openFilter], ['adj', '🎚', 'Sesuaikan', openAdjust],
-  ['vol', '🔊', 'Volume', openVol], ['audio', '♪', 'Audio', openAudio], ['extract', '⇣', 'Ekstrak audio', doExtract],
+  ['vol', '🔊', 'Volume', openVol], ['audio', '♪', 'Audio', openAudio], ['sfx', '🌿', 'Efek suara', openSfx], ['extract', '⇣', 'Ekstrak audio', doExtract],
   ['text', 'Aa', 'Teks', openText], ['del', '🗑', 'Hapus', doDelete], ['dup', '⧉', 'Duplikat', doDup],
   ['order', '⇆', 'Urutan', openOrder], ['ratio', '▭', 'Rasio', openRatio],
 ];
